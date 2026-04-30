@@ -133,6 +133,8 @@ configure_token_auth() {
     echo "Token认证 (推荐)"
     echo "----------------"
     read -p "Git仓库URL (例如: https://github.com/my-org/repo.git): " GIT_URL
+    echo ""
+    echo "GIT_URL: $GIT_URL"
     
     if [[ -z "$GIT_URL" ]]; then
         echo_error "Git URL不能为空"
@@ -155,7 +157,8 @@ configure_token_auth() {
     echo ""
     
     read -sp "请输入Git Token: " GIT_TOKEN
-    echo
+    echo ""
+    echo "GIT_TOKEN: $GIT_TOKEN"
     
     if [[ -z "$GIT_TOKEN" ]]; then
         echo_error "Git Token不能为空"
