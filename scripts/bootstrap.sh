@@ -31,6 +31,7 @@ DEFAULT_INTERVAL="5m"           # Flux同步间隔
 DEFAULT_COMPONENTS="source-controller,kustomize-controller,helm-controller,notification-controller"  # Flux组件
 DEFAULT_USERNAME="git"          # 默认Git用户名
 DEFAULT_AUTH_TYPE="auto"        # 默认认证类型: auto, token, ssh, basic
+DEFAULT_ASSOCIATE_MODE="false"  # 默认使用官方 Bootstrap 模式
 
 # 解析命令行参数
 parse_args() {
@@ -130,16 +131,12 @@ parse_args() {
                 AUTH_TYPE="$2"
                 shift 2
                 ;;
-            --private)
-                GIT_PRIVATE="true"
-                shift
-                ;;
-            --public)
-                GIT_PRIVATE="false"
-                shift
-                ;;
             --dry-run)
                 DRY_RUN="true"
+                shift
+                ;;
+            --associate)
+                ASSOCIATE_MODE="true"
                 shift
                 ;;
             --debug)
@@ -258,7 +255,6 @@ validate_parameters() {
     NAMESPACE="${NAMESPACE:-$DEFAULT_NAMESPACE}"
     FLUX_INTERVAL="${FLUX_INTERVAL:-$DEFAULT_INTERVAL}"
     FLUX_COMPONENTS="${FLUX_COMPONENTS:-$DEFAULT_COMPONENTS}"
-    GIT_PRIVATE="${GIT_PRIVATE:-true}"
     AUTH_TYPE="${AUTH_TYPE:-$DEFAULT_AUTH_TYPE}"
     
     # 自动检测认证类型
@@ -446,119 +442,142 @@ prepare_ssh_auth() {
     return 0
 }
 
-# 构建Flux引导命令
-build_flux_command() {
-    local cluster_name="$1"
-    local flux_path="${FLUX_PATH:-clusters/$cluster_name}"
-    local cmd="flux bootstrap git"
-    
-    # 基本参数
-    cmd+=" --url=\"$GIT_URL\""
-    cmd+=" --branch=\"$GIT_BRANCH\""
-    cmd+=" --path=\"$flux_path\""
-    cmd+=" --interval=\"$FLUX_INTERVAL\""
-    cmd+=" --components=\"$FLUX_COMPONENTS\""
-    cmd+=" --private=\"$GIT_PRIVATE\""
-    cmd+=" --timeout=5m"
-    
-    # 根据认证类型添加参数
+# 官方引导模式：执行完整的 bootstrap
+run_boot_logic() {
+    local cluster_name=$1
+    local kubeconfig=$2
+    local flux_path=$3
+
+    log_step "执行官方 Bootstrap 引导 (会写回配置到 Git)..."
+
+    # 构建基础命令参数数组 (避免 eval 的引用问题)
+    local args=(
+        bootstrap git
+        --url="$GIT_URL"
+        --branch="$GIT_BRANCH"
+        --path="$flux_path"
+        --interval="$FLUX_INTERVAL"
+        --components="$FLUX_COMPONENTS"
+        --timeout="5m"
+        --silent
+        --kubeconfig="$kubeconfig"
+    )
+
+    # 根据认证类型动态添加参数
     case "$AUTH_TYPE" in
         token)
-            cmd+=" --username=\"git\""
-            cmd+=" --password=\"$GIT_TOKEN\""
+            args+=(--username="git" --password="$GIT_TOKEN" --token-auth=true)
             ;;
         basic)
-            cmd+=" --username=\"$GIT_USERNAME\""
-            cmd+=" --password=\"$GIT_PASSWORD\""
+            args+=(--username="$GIT_USERNAME" --password="$GIT_PASSWORD")
             ;;
         ssh)
-            cmd+=" --ssh-key-algorithm=ed25519"
-            cmd+=" --ssh-ecdsa-curve=p256"
-            cmd+=" --ssh-rsa-bits=4096"
+            args+=(--ssh-key-algorithm="ed25519")
             ;;
     esac
-    
-    # 调试模式
+
     if [[ "$DEBUG" == "true" ]]; then
-        cmd+=" --verbose"
+        args+=(--verbose)
     fi
-    
-    echo "$cmd"
+
+    # 直接执行命令
+    flux "${args[@]}"
 }
 
-# 引导单个集群
+# 关联模式：只读同步，不修改 Git
+run_associate_logic() {
+    local cluster_name=$1
+    local kubeconfig=$2
+    local flux_path=$3
+    local secret_name="flux-git-auth"
+    local source_name="${cluster_name}-repo"
+    local kustomization_name="${cluster_name}-sync"
+
+    log_step "执行关联模式 (仅建立只读连接)..."
+
+    # 1. 确保引擎安装
+    if ! kubectl get ns flux-system --kubeconfig="$kubeconfig" &>/dev/null; then
+        log_info "未检测到 Flux 环境，正在安装核心组件..."
+        flux install --kubeconfig="$kubeconfig"
+    fi
+
+    # 2. 配置 Secret
+    log_info "配置 Git 凭据: $secret_name"
+    case "$AUTH_TYPE" in
+        token|basic)
+            local pwd="${GIT_TOKEN:-$GIT_PASSWORD}"
+            kubectl create secret generic "$secret_name" \
+                --namespace="flux-system" \
+                --from-literal=username="${GIT_USERNAME:-git}" \
+                --from-literal=password="$pwd" \
+                --kubeconfig="$kubeconfig" \
+                --dry-run=client -o yaml | kubectl apply -f -
+            ;;
+        ssh)
+            flux create secret git "$secret_name" \
+                --url="$GIT_URL" \
+                --private-key-file="$SSH_KEY_PATH" \
+                --kubeconfig="$kubeconfig"
+            ;;
+    esac
+
+    # 3. 创建 Source
+    flux create source git "$source_name" \
+        --url="$GIT_URL" \
+        --branch="$GIT_BRANCH" \
+        --secret-ref="$secret_name" \
+        --interval="$FLUX_INTERVAL" \
+        --kubeconfig="$kubeconfig"
+
+    # 4. 创建 Kustomization
+    flux create kustomization "$kustomization_name" \
+        --source="GitRepository/$source_name" \
+        --path="$flux_path" \
+        --prune=true \
+        --interval="$FLUX_INTERVAL" \
+        --kubeconfig="$kubeconfig"
+}
+
 bootstrap_single_cluster() {
     local cluster_name="$1"
     local kubeconfig="scripts/kubeconfigs/$cluster_name.yaml"
-    
+    local flux_path="${FLUX_PATH:-clusters/$cluster_name}"
+    local result=0
+
     echo ""
     echo "========================================"
     log_step "处理集群: $cluster_name"
     echo "========================================"
+
+    if ! validate_kubeconfig "$cluster_name"; then return 1; fi
     
-    # 验证kubeconfig文件
-    if ! validate_kubeconfig "$cluster_name"; then
+    # 注意：这里不再需要手动 export KUBECONFIG，因为内部函数显式使用了 --kubeconfig
+
+    if ! kubectl cluster-info --kubeconfig="$kubeconfig" &>/dev/null; then
+        log_error "无法连接到集群 $cluster_name，请检查 kubeconfig"
         return 1
     fi
-    
-    # 设置kubeconfig
-    export KUBECONFIG="$kubeconfig"
-    
-    # 测试集群连接
-    if ! test_cluster_connection; then
-        log_error "无法连接到集群 $cluster_name，请检查kubeconfig"
-        return 1
-    fi
-    
-    # 显示集群信息
-    local context=$(kubectl config current-context 2>/dev/null || echo "unknown")
-    log_info "Kubernetes上下文: $context"
-    
-    # 检查是否已安装Flux
-    if kubectl get namespace flux-system &> /dev/null; then
-        log_warn "Flux 已安装，将重新引导"
-    fi
-    
-    # 创建应用命名空间
-    create_namespace "$NAMESPACE"
-    
-    # 准备认证
-    if [[ "$AUTH_TYPE" == "ssh" ]]; then
-        prepare_ssh_auth "$cluster_name"
-    fi
-    
-    # 构建Flux命令
-    local flux_cmd=$(build_flux_command "$cluster_name")
-    
-    if [[ "$DRY_RUN" == "true" ]]; then
-        log_info "[DRY RUN] 将执行: $flux_cmd"
-        return 0
-    fi
-    
-    # 引导Flux
-    log_step "引导Flux..."
-    log_info "认证类型: $AUTH_TYPE"
-    log_info "Git仓库: $GIT_URL"
-    
-    # 创建flux-system命名空间
-    kubectl create namespace flux-system --dry-run=client -o yaml | kubectl apply -f -
-    
-    # 执行Flux引导
-    eval "$flux_cmd"
-    
-    local result=$?
-    
-    if [[ $result -eq 0 ]]; then
-        log_info "✅ 集群 $cluster_name 引导成功"
-        
-        # 显示状态
-        show_flux_status "$cluster_name"
-        
-        return 0
+
+    # 执行逻辑分流
+    set +e # 临时关闭错误退出，以便记录失败结果
+    if [[ "$ASSOCIATE_MODE" == "true" ]]; then
+        if [[ "$DRY_RUN" == "true" ]]; then
+            log_info "[DRY RUN] 将执行 run_associate_logic"
+        else
+            run_associate_logic "$cluster_name" "$kubeconfig" "$flux_path"
+            result=$?
+        fi
     else
-        log_error "❌ 集群 $cluster_name 引导失败 (退出码: $result)"
-        return 1
+        if [[ "$DRY_RUN" == "true" ]]; then
+            log_info "[DRY RUN] 将执行 run_boot_logic"
+        else
+            run_boot_logic "$cluster_name" "$kubeconfig" "$flux_path"
+            result=$?
+        fi
     fi
+    set -e 
+
+    return $result
 }
 
 # 显示Flux状态
@@ -591,7 +610,7 @@ main() {
     # 获取集群列表
     local cluster_list
     cluster_list=$(get_cluster_list)
-    
+
     if [[ -z "$cluster_list" ]]; then
         log_error "没有找到可用的集群配置"
         echo "请在scripts/kubeconfigs/目录下添加集群的kubeconfig文件"
@@ -615,47 +634,46 @@ main() {
         echo "  SSH密钥:  $SSH_KEY_PATH"
     fi
     
-    echo "  私有仓库:  $GIT_PRIVATE"
-    echo ""
-    
-    # 获取集群列表用于显示
-    local cluster_array=()
+    # 显示集群
+    log_info "目标集群:"
     while IFS= read -r cluster; do
-        [[ -n "$cluster" ]] && cluster_array+=("$cluster")
+        [[ -n "$cluster" ]] && echo "  - $cluster"
     done <<< "$cluster_list"
-    
-    local cluster_count=${#cluster_array[@]}
-    
-    log_info "目标集群 (${cluster_count}个):"
-    for cluster in "${cluster_array[@]}"; do
-        echo "  - $cluster"
-    done
-    
+
     echo ""
     
-    # 确认操作
+    # 1. 转换并清理数组
+    mapfile -t cluster_array < <(get_cluster_list | grep -v '^$')
+    local total_count=${#cluster_array[@]}
+
+    if [[ $total_count -eq 0 ]]; then
+        log_error "未检测到有效的集群配置，退出。"
+        exit 1
+    fi
+
+    # 2. 交互确认
     if [[ "$DRY_RUN" != "true" ]]; then
-        if [[ $cluster_count -gt 1 ]]; then
-            read -p "确定要引导以上 ${cluster_count} 个集群吗? (y/N): " -n 1 -r confirm
-            echo
+        if [[ $total_count -gt 1 ]]; then
+            log_warn "即将对 $total_count 个集群执行引导操作。"
+            echo -n "确定继续吗? (y/N): "
+            read -r confirm < /dev/tty
             if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-                log_info "操作取消"
+                log_info "操作已取消。"
                 exit 0
             fi
         fi
     fi
     
-    # 引导每个集群
+    # 3. 迭代执行
     local success_count=0
-    local total_count=0
-    
     for cluster in "${cluster_array[@]}"; do
-        if [[ -n "$cluster" ]]; then
-            ((total_count++))
-            
-            if bootstrap_single_cluster "$cluster"; then
-                ((success_count++))
-            fi
+        [[ -z "$cluster" ]] && continue  # 再次防御空行
+        
+        log_step "准备引导集群: ${cluster}"
+        if bootstrap_single_cluster "$cluster"; then
+            ((success_count++))
+        else
+            log_error "集群 ${cluster} 引导失败，继续下一个..."
         fi
     done
     
