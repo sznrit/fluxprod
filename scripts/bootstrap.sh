@@ -442,140 +442,117 @@ prepare_ssh_auth() {
     return 0
 }
 
-# 官方引导模式：执行完整的 bootstrap
+# ==========================================
+# 模式 A：官方引导模式 (Run Boot Logic)
+# ==========================================
 run_boot_logic() {
     local cluster_name=$1
     local kubeconfig=$2
     local flux_path=$3
 
-    log_step "执行官方 Bootstrap 引导 (会写回配置到 Git)..."
+    log_step "执行官方引导模式: 强制覆盖现有配置..."
 
-    # 构建基础命令参数数组 (避免 eval 的引用问题)
+    local final_user="${GIT_USERNAME:-git}"
+
+    # 增加 --timeout 以应对不稳定的网络
     local args=(
         bootstrap git
         --url="$GIT_URL"
         --branch="$GIT_BRANCH"
         --path="$flux_path"
         --interval="$FLUX_INTERVAL"
-        --components="$FLUX_COMPONENTS"
-        --timeout="5m"
-        --silent
+        --timeout="10m"
         --kubeconfig="$kubeconfig"
+        --username="$final_user"
+        --password="$GIT_TOKEN"
+        --token-auth=true
+        --silent
     )
 
-    # 根据认证类型动态添加参数
-    case "$AUTH_TYPE" in
-        token)
-            args+=(--username="git" --password="$GIT_TOKEN" --token-auth=true)
-            ;;
-        basic)
-            args+=(--username="$GIT_USERNAME" --password="$GIT_PASSWORD")
-            ;;
-        ssh)
-            args+=(--ssh-key-algorithm="ed25519")
-            ;;
-    esac
-
-    if [[ "$DEBUG" == "true" ]]; then
-        args+=(--verbose)
+    # Flux Bootstrap 内部会自动执行类似 apply 的逻辑覆盖旧密钥
+    if flux "${args[@]}"; then
+        log_success "集群 $cluster_name 引导成功"
+    else
+        log_error "集群 $cluster_name 引导失败，建议改用 --associate 模式"
+        return 1
     fi
-
-    # 直接执行命令
-    flux "${args[@]}"
 }
 
-# 关联模式：只读同步，不修改 Git
+# ==========================================
+# 模式 B：关联模式 (Run Associate Logic)
+# ==========================================
 run_associate_logic() {
     local cluster_name=$1
     local kubeconfig=$2
     local flux_path=$3
     local secret_name="flux-git-auth"
-    local source_name="${cluster_name}-repo"
-    local kustomization_name="${cluster_name}-sync"
 
-    log_step "执行关联模式 (仅建立只读连接)..."
+    log_step "执行关联模式: 强制更新凭据并建立同步..."
 
-    # 1. 确保引擎安装
-    if ! kubectl get ns flux-system --kubeconfig="$kubeconfig" &>/dev/null; then
-        log_info "未检测到 Flux 环境，正在安装核心组件..."
-        flux install --kubeconfig="$kubeconfig"
-    fi
+    # 1. 动态确定用户名 (兼容所有 Git 服务商)
+    local final_user="${GIT_USERNAME:-git}"
+    local final_pass="${GIT_TOKEN:-$GIT_PASSWORD}"
 
-    # 2. 配置 Secret
-    log_info "配置 Git 凭据: $secret_name"
-    case "$AUTH_TYPE" in
-        token|basic)
-            local pwd="${GIT_TOKEN:-$GIT_PASSWORD}"
-            kubectl create secret generic "$secret_name" \
-                --namespace="flux-system" \
-                --from-literal=username="${GIT_USERNAME:-git}" \
-                --from-literal=password="$pwd" \
-                --kubeconfig="$kubeconfig" \
-                --dry-run=client -o yaml | kubectl apply -f -
-            ;;
-        ssh)
-            flux create secret git "$secret_name" \
-                --url="$GIT_URL" \
-                --private-key-file="$SSH_KEY_PATH" \
-                --kubeconfig="$kubeconfig"
-            ;;
-    esac
+    # 2. 强制覆盖 Secret
+    log_info "覆盖 Git 凭据: 用户名=$final_user"
+    kubectl create secret generic "$secret_name" \
+        --namespace="flux-system" \
+        --from-literal=username="$final_user" \
+        --from-literal=password="$final_pass" \
+        --kubeconfig="$kubeconfig" \
+        --dry-run=client -o yaml | kubectl apply -f -
 
-    # 3. 创建 Source
-    flux create source git "$source_name" \
+    # 3. 强制覆盖 Source (GitRepository)
+    log_info "同步 GitRepository 配置..."
+    flux create source git "${cluster_name}-repo" \
         --url="$GIT_URL" \
         --branch="$GIT_BRANCH" \
         --secret-ref="$secret_name" \
         --interval="$FLUX_INTERVAL" \
-        --kubeconfig="$kubeconfig"
+        --kubeconfig="$kubeconfig" \
+        --export | kubectl apply -f -
 
-    # 4. 创建 Kustomization
-    flux create kustomization "$kustomization_name" \
-        --source="GitRepository/$source_name" \
+    # 4. 强制覆盖 Kustomization
+    log_info "同步 Kustomization 配置..."
+    flux create kustomization "${cluster_name}-sync" \
+        --source="GitRepository/${cluster_name}-repo" \
         --path="$flux_path" \
         --prune=true \
         --interval="$FLUX_INTERVAL" \
-        --kubeconfig="$kubeconfig"
+        --kubeconfig="$kubeconfig" \
+        --export | kubectl apply -f -
+    
+    log_success "关联指令已发送。请稍后使用 'flux get sources git' 查看集群拉取状态。"
 }
 
+# ==========================================
+# 主入口分流 (Bootstrap Single Cluster)
+# ==========================================
 bootstrap_single_cluster() {
     local cluster_name="$1"
     local kubeconfig="scripts/kubeconfigs/$cluster_name.yaml"
     local flux_path="${FLUX_PATH:-clusters/$cluster_name}"
-    local result=0
-
-    echo ""
-    echo "========================================"
-    log_step "处理集群: $cluster_name"
-    echo "========================================"
-
-    if ! validate_kubeconfig "$cluster_name"; then return 1; fi
     
-    # 注意：这里不再需要手动 export KUBECONFIG，因为内部函数显式使用了 --kubeconfig
+    # 基础校验
+    if ! validate_kubeconfig "$cluster_name"; then return 1; fi
 
-    if ! kubectl cluster-info --kubeconfig="$kubeconfig" &>/dev/null; then
-        log_error "无法连接到集群 $cluster_name，请检查 kubeconfig"
-        return 1
-    fi
-
-    # 执行逻辑分流
-    set +e # 临时关闭错误退出，以便记录失败结果
+    # 模式选择
+    local result=0
+    set +e
     if [[ "$ASSOCIATE_MODE" == "true" ]]; then
-        if [[ "$DRY_RUN" == "true" ]]; then
-            log_info "[DRY RUN] 将执行 run_associate_logic"
-        else
-            run_associate_logic "$cluster_name" "$kubeconfig" "$flux_path"
-            result=$?
-        fi
+        run_associate_logic "$cluster_name" "$kubeconfig" "$flux_path"
+        result=$?
     else
-        if [[ "$DRY_RUN" == "true" ]]; then
-            log_info "[DRY RUN] 将执行 run_boot_logic"
-        else
-            run_boot_logic "$cluster_name" "$kubeconfig" "$flux_path"
-            result=$?
-        fi
+        run_boot_logic "$cluster_name" "$kubeconfig" "$flux_path"
+        result=$?
     fi
-    set -e 
+    set -e
+
+    if [[ $result -eq 0 ]]; then
+        log_success "集群 $cluster_name 配置处理完成"
+    else
+        log_error "集群 $cluster_name 配置处理失败"
+    fi
 
     return $result
 }
